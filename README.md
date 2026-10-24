@@ -63,6 +63,11 @@ Run the agent:
 python main_agent.py
 ```
 
+If you want to launch the Streamlit interface:
+
+```bash
+python -m streamlit run app.py
+```
 ## Example Research Task
 
 > Research the Python 3.14 `concurrent.interpreters` API using only official documentation. Show how to create an interpreter and execute code. Do not guess API names or signatures.
