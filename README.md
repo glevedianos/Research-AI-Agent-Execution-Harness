@@ -4,6 +4,8 @@ A Python-based AI research assistant that combines LLM-driven tool use with a cu
 
 The agent can search the web, retrieve documentation, and answer technical questions using external sources. The harness manages tool execution, resource limits, validation, and structured logging.
 
+The code was written in Python version 3.12.10
+
 ## Features
 
 - **Autonomous research:** Uses an LLM to decide when to search the web, retrieve webpages, and generate an answer.
