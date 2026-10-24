@@ -15,7 +15,10 @@ The agent can search the web, retrieve documentation, and answer technical quest
 - **Tool caching:** Reuses results from identical tool calls within a research run.
 - **Error handling:** Handles tool failures and recognized LLM token-limit errors.
 - **Structured logging:** Records research execution events for debugging and inspection.
-- **Automated testing:** 70 passing tests covering agent and harness functionality.
+- **Streamlit GUI:** Provides chat history, configurable progress displays, and execution details.
+- **Mock Mode:** Supports testing without consuming API tokens.
+-	**Automated Tests:** Covers retry handling, progress events, tool execution, caching, and execution budgets.
+
 
 ## Tech Stack
 
