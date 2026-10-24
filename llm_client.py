@@ -14,7 +14,8 @@ from openai import (
 )
 
 from harness.logger import log_event
-
+from api_errors import classify_api_error
+from harness.progress import emit_progress
 
 load_dotenv()
 
@@ -64,7 +65,7 @@ class LLMClient:
         )
 
 
-    def _request(self, messages, tools=None):
+    def _request(self, messages, tools=None, progress_callback=None):
         max_attempts = 4
         invalid_tool_retries = 0
 
@@ -176,6 +177,7 @@ class LLMClient:
 
                 raise
 
+
             except (
                 RateLimitError,
                 APIConnectionError,
@@ -183,60 +185,119 @@ class LLMClient:
                 InternalServerError,
             ) as error:
 
+                attempt_number = attempt + 1
+
                 log_event(
                     "llm_request_error",
                     error_type=type(error).__name__,
-                    attempt=attempt + 1,
+                    attempt=attempt_number,
                 )
 
-                # Daily quota exhaustion cannot be fixed
-                # by retrying immediately.
-                if isinstance(error, RateLimitError):
-                    error_text = str(error)
+                # Classify provider limits.
+                api_limit = classify_api_error(error)
 
-                    if (
-                        "free-models-per-day" in error_text
-                        or "openrouter_free_tier_daily"
-                        in error_text
-                    ):
-                        print(
-                            "[HARNESS] Daily free API quota "
-                            "exhausted."
-                        )
-                        raise
-
-                if attempt == max_attempts - 1:
-                    raise
-
-
-                delay = min(2 ** attempt, 8) + random.uniform(0, 1)
-
-                if isinstance(error, RateLimitError):
-                    import re
-
-                    match = re.search(
-                        r"Please try again in ([\d.]+)s",
-                        str(error),
+                # Daily quotas should not be retried immediately.
+                if (
+                    api_limit is not None
+                    and api_limit.limit_type == "daily"
+                ):
+                    print(
+                        "[HARNESS] Daily API quota exhausted."
                     )
 
-                    if match:
-                        requested_delay = float(match.group(1))
+                    log_event(
+                        "llm_quota_exhausted",
+                        limit_type="daily",
+                        attempt=attempt_number,
+                    )
 
-                        # Respect the API's requested delay,
-                        # allowing a small safety margin.
-                        delay = max(delay, requested_delay + 1)
+                    raise api_limit from error
 
+                # No retries remain.
+                if attempt_number >= max_attempts:
+                    if api_limit is not None:
+                        raise api_limit from error
+
+                    raise
+
+                # Exponential backoff with jitter.
+                delay = min(
+                    2 ** attempt, 8
+                ) + random.uniform(0, 1)
+
+                # Respect the provider's retry delay.
+                if (
+                    api_limit is not None
+                    and api_limit.retry_after is not None
+                ):
+                    delay = max(
+                        delay,
+                        api_limit.retry_after + 1
+                    )
+
+                # Keep requests within a reasonable
+                # interactive waiting budget.
+                max_wait_seconds = 60
+
+                if delay > max_wait_seconds:
+                    print(
+                        "[HARNESS] Retry delay exceeds "
+                        "the interactive waiting budget."
+                    )
+
+                    if api_limit is not None:
+                        raise api_limit from error
+
+                    raise
 
                 print(
-                    f"[WARNING] Temporary API failure. "
-                    f"Retrying in {delay:.1f}s..."
+                    f"[HARNESS] Request failed. "
+                    f"Retry {attempt_number}/{max_attempts - 1} "
+                    f"in {delay:.1f} seconds."
+                )
+
+                log_event(
+                    "llm_retry_scheduled",
+                    attempt=attempt_number,
+                    next_attempt=attempt_number + 1,
+                    max_attempts=max_attempts,
+                    delay_seconds=round(delay, 2),
+                    error_type=type(error).__name__,
+                )
+
+                emit_progress(
+                    progress_callback,
+                    "llm_retry",
+                    (
+                        f"API request failed. "
+                        f"Retrying in {delay:.1f} seconds "
+                        f"(attempt {attempt_number + 1}"
+                        f"/{max_attempts})"
+                    ),
+                    "running",
+                    next_attempt=attempt_number + 1,
+                    max_attempts=max_attempts,
+                    delay_seconds=round(delay, 2),
                 )
 
                 time.sleep(delay)
 
-    def chat(self, messages: list[dict]) -> str:
-        response = self._request(messages)
+
+    def chat(self, messages, progress_callback=None):
+        response = self._request(
+            messages,
+            progress_callback=progress_callback,
+        )
         return response.content or ""
 
-    def chat_with_tools(self, messages, tools):
-        return self._request(messages, tools)
+    def chat_with_tools(
+        self,
+        messages,
+        tools,
+        progress_callback=None,
+    ):
+        return self._request(
+            messages,
+            tools=tools,
+            progress_callback=progress_callback,
+        )

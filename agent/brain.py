@@ -20,6 +20,9 @@ from harness.documentation import (
     combine_documentation_content,
     find_relevant_documentation,
 )
+from api_errors import classify_api_error
+from harness.progress import emit_progress
+
 
 SYSTEM_PROMPT = """
 You are an autonomous AI Research Assistant.
@@ -354,7 +357,7 @@ class ResearchAgent:
                if sources else "")
         )
 
-    def run(self, question: str) -> str:
+    def run(self, question: str,  progress_callback=None) -> str:
         """
         Run the research agent with execution budgets.
         """
@@ -383,6 +386,14 @@ class ResearchAgent:
             max_iterations=self.max_iterations,
             max_tool_calls=self.max_tool_calls,
             max_duration_seconds=self.max_duration_seconds
+        )
+
+        emit_progress(
+            progress_callback,
+            "research",
+            "Research started",
+            "running",
+            run_id=run_id,
         )
 
         try:
@@ -414,21 +425,40 @@ class ResearchAgent:
                     tool_calls_used=tool_calls_used
                 )
 
+                emit_progress(
+                    progress_callback,
+                    "analysis",
+                    "Analyzing research information",
+                    "running",
+                    iteration=iteration,
+                    max_iterations=self.max_iterations,
+                )
+
                 # Request the next decision from the LLM.
                 llm_start = time.perf_counter()
 
+                
                 try:
                     response = self.llm.chat_with_tools(
                         messages,
-                        TOOL_SCHEMAS
+                        TOOL_SCHEMAS,
+                        progress_callback=progress_callback,
                     )
+
                 except Exception as error:
+                    api_limit = classify_api_error(error)
+
+                    if api_limit is not None:
+                        raise api_limit from error
+
                     if self._is_token_limit_error(error):
                         return self._provider_limit_response(
                             error, run_id, documentation_records
                         )
+
                     raise
 
+                    
                 llm_duration_ms = round(
                     (
                         time.perf_counter() - llm_start
@@ -489,13 +519,21 @@ class ResearchAgent:
                         )
                     )
 
-                    return self.validate_answer(
+                    validated_answer = self.validate_answer(
                         answer,
                         documentation=combine_documentation_content(
                             documentation_records
                         ),
                         documentation_records=documentation_records
                     )
+
+                    emit_progress(
+                        progress_callback,
+                        "research",
+                        "Research completed",
+                        "completed",
+                    )
+                    return validated_answer
 
                 # CASE 2: The LLM requested tools.
                 budget_exhausted = False
@@ -568,11 +606,53 @@ class ResearchAgent:
                                 "tool_cache_hit", run_id=run_id, tool=name
                             )
                         else:
+
                             tool_calls_used += 1
-                            result = execute_tool(
-                                name, arguments, run_id=run_id
+
+                            tool_labels = {
+                                "web_search": "Searching the web",
+                                "read_webpage": "Reading sources",
+                            }
+
+                            stage = name
+                            label = tool_labels.get(
+                                name, "Executing research tool"
                             )
+
+                            emit_progress(
+                                progress_callback,
+                                stage,
+                                label,
+                                "running",
+                                tool=name,
+                                tool_call_number=tool_calls_used,
+                            )
+
+                            result = execute_tool(
+                                name,
+                                arguments,
+                                run_id=run_id,
+                            )
+
                             tool_cache[cache_key] = result
+
+                            try:
+                                tool_succeeded = bool(
+                                    json.loads(result).get("success")
+                                )
+                            except (ValueError, TypeError, AttributeError):
+                                tool_succeeded = False
+
+                            emit_progress(
+                                progress_callback,
+                                stage,
+                                label if tool_succeeded
+                                else f"{label} failed",
+                                "completed" if tool_succeeded
+                                else "failed",
+                                tool=name,
+                            )
+
 
 
                         # Collect successful webpage content for API verification.
@@ -674,13 +754,30 @@ class ResearchAgent:
                 )
             })
 
+            emit_progress(
+                progress_callback,
+                "answer",
+                "Preparing the final answer",
+                "running",
+            )
+
             try:
-                final_answer = self.llm.chat(messages)
+                final_answer = self.llm.chat(
+                    messages,
+                    progress_callback=progress_callback,
+                    )
+
             except Exception as error:
+                api_limit = classify_api_error(error)
+
+                if api_limit is not None:
+                    raise api_limit from error
+
                 if self._is_token_limit_error(error):
                     return self._provider_limit_response(
                         error, run_id, documentation_records
                     )
+
                 raise
 
             if not final_answer.strip():
@@ -716,7 +813,7 @@ class ResearchAgent:
                 )
             )
 
-            return self.validate_answer(
+            validated_answer = self.validate_answer(
                 final_answer,
                 documentation=combine_documentation_content(
                     documentation_records
@@ -724,7 +821,23 @@ class ResearchAgent:
                 documentation_records=documentation_records
             )
 
+            emit_progress(
+                        progress_callback,
+                        "research",
+                        "Research completed",
+                        "completed",
+                    )
+            return validated_answer
+
         except Exception as error:
+
+            emit_progress(
+                progress_callback,
+                "research",
+                "Research failed",
+                "failed",
+                error_type=type(error).__name__,
+            )
 
             log_event(
                 "agent_error",
